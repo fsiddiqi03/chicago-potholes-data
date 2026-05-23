@@ -1,0 +1,111 @@
+name: Deploy Lambda
+
+on:
+  push:
+    branches: [main]
+    # Only deploy when something Lambda actually needs has changed.
+    paths:
+      - 'src/**'
+      - 'requirements.txt'
+      - '.github/workflows/deploy-lambda.yml'
+  workflow_dispatch:  # Allows manual triggering from the Actions tab
+
+# OIDC requires id-token: write at the job (or workflow) level.
+# contents: read is the default but explicit is better.
+permissions:
+  id-token: write
+  contents: read
+
+# Don't let two deploys race — if a second push comes in while one's
+# running, queue it and cancel any pending older runs.
+concurrency:
+  group: deploy-lambda
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build & deploy
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: us-east-1
+      FUNCTION_NAME: chicago-pothole-ingest
+      PYTHON_VERSION: '3.12'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Configure AWS credentials (via OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build deployment package
+        run: |
+          # Clean slate.
+          rm -rf build lambda_deploy.zip
+
+          # Install deps targeting Lambda's Linux x86_64 runtime explicitly.
+          pip install \
+            --platform manylinux2014_x86_64 \
+            --target build \
+            --only-binary=:all: \
+            --python-version ${{ env.PYTHON_VERSION }} \
+            --implementation cp \
+            --upgrade \
+            -r requirements.txt
+
+          # Copy our source code into the build dir.
+          cp -r src build/
+
+          # Trim noise: cached bytecode and dist-info dirs add MB for nothing.
+          find build -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+          find build -type d -name "*.dist-info" -exec rm -rf {} + 2>/dev/null || true
+          find build -type d -name "*.egg-info" -exec rm -rf {} + 2>/dev/null || true
+
+          # Zip it. Inside the build dir so paths in the zip are relative.
+          cd build
+          zip -r ../lambda_deploy.zip . -x "*.pyc"
+
+          # Show what we built (size + top-level contents).
+          cd ..
+          echo "Package size: $(du -h lambda_deploy.zip | cut -f1)"
+          echo "Top-level contents:"
+          unzip -l lambda_deploy.zip | head -30
+
+      - name: Update Lambda function code
+        run: |
+          aws lambda update-function-code \
+            --function-name "${{ env.FUNCTION_NAME }}" \
+            --zip-file fileb://lambda_deploy.zip \
+            --publish \
+            --no-cli-pager
+
+      - name: Wait for function update to finish
+        run: |
+          aws lambda wait function-updated \
+            --function-name "${{ env.FUNCTION_NAME }}"
+
+      - name: Update handler configuration
+        # Only needs to run when the handler path or env-vars change. Cheap
+        # to run on every deploy though, and idempotent. Keeps the handler
+        # path in version control.
+        run: |
+          aws lambda update-function-configuration \
+            --function-name "${{ env.FUNCTION_NAME }}" \
+            --handler "src.lambda_handler.handler" \
+            --no-cli-pager
+
+      - name: Verify deployment
+        run: |
+          aws lambda get-function-configuration \
+            --function-name "${{ env.FUNCTION_NAME }}" \
+            --query '{Handler:Handler,Runtime:Runtime,Memory:MemorySize,Timeout:Timeout,Version:Version,LastModified:LastModified}' \
+            --output table

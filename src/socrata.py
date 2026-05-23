@@ -46,6 +46,26 @@ def _build_session() -> requests.Session:
     return session
 
 
+def _normalize_socrata_timestamp(value: str) -> str:
+    """
+    Convert an ISO timestamp string to the format Socrata's SoQL expects:
+    'YYYY-MM-DDTHH:MM:SS' (no timezone, no fractional seconds).
+
+    The city's created_date and last_modified_date are timezone-naive
+    'floating timestamps' in SoQL. Passing strings with timezone suffixes
+    triggers a type-mismatch error. We strip both.
+
+    Accepts:  '2026-05-21'                        -> '2026-05-21T00:00:00'
+              '2026-05-21T22:35:38'               -> '2026-05-21T22:35:38'
+              '2026-05-21T22:35:38.520401+00:00'  -> '2026-05-21T22:35:38'
+    """
+    from dateutil import parser as dateparser
+
+    dt = dateparser.isoparse(value)
+    # Drop tz and microseconds — Socrata wants 'YYYY-MM-DDTHH:MM:SS'.
+    return dt.replace(tzinfo=None, microsecond=0).isoformat()
+
+
 def _build_where_clause(
     created_after: Optional[str] = None,
     modified_after: Optional[str] = None,
@@ -53,21 +73,19 @@ def _build_where_clause(
     """
     Construct a Socrata $where clause string from optional filters.
 
-    Returns None if no filters apply (meaning 'all rows').
+    Returns None if no filters apply.
 
-    created_after  -> for backfill: only fetch rows created after this date
-    modified_after -> for incremental: rows updated since our last sync
-                      (uses last_modified_date, which captures status changes too)
-
-    If both are provided, they're AND'd. In practice you use one or the
-    other: created_after for the initial backfill, modified_after for
-    daily updates afterward.
+    Both filter values must be ISO datetime strings. We normalize them
+    to Socrata's expected format and wrap in cast() so SoQL treats them
+    as timestamps rather than text.
     """
     clauses: list[str] = []
     if created_after:
-        clauses.append(f"created_date > '{created_after}'")
+        ts = _normalize_socrata_timestamp(created_after)
+        clauses.append(f"created_date > '{ts}'")
     if modified_after:
-        clauses.append(f"last_modified_date > '{modified_after}'")
+        ts = _normalize_socrata_timestamp(modified_after)
+        clauses.append(f"last_modified_date > '{ts}'")
     if not clauses:
         return None
     return " AND ".join(clauses)

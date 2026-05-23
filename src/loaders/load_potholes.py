@@ -26,6 +26,7 @@ from psycopg2.extras import Json, execute_batch
 from ..db import get_connection
 from ..socrata import fetch_potholes
 from ..transforms.pothole import normalize_record
+from ..transforms.stats import refresh_all
 
 logging.basicConfig(
     level=logging.INFO,
@@ -256,7 +257,7 @@ def ingest(
 
                     batch.append(normalized)
                     if len(batch) >= UPSERT_BATCH_SIZE:
-                        ins, upd = _flush_batch(cur, batch)
+                        ins, upd = _flush_batch(cur, batch, conn=conn)
                         inserted += ins
                         updated += upd
                         batch = []
@@ -269,7 +270,7 @@ def ingest(
 
                 # Flush the tail.
                 if batch:
-                    ins, upd = _flush_batch(cur, batch)
+                    ins, upd = _flush_batch(cur, batch, conn=conn)
                     inserted += ins
                     updated += upd
 
@@ -285,6 +286,11 @@ def ingest(
                         ],
                         page_size=500,
                     )
+                
+                # Refresh derived stats tables. Runs in the same transaction
+                # so the ingest+refresh appear atomically to readers.
+                logger.info("Refreshing derived stats...")
+                refresh_all(cur)
 
                 # Mark the run successful in the same transaction.
                 finish_ingest_run(
@@ -314,14 +320,12 @@ def ingest(
     )
 
 
-def _flush_batch(cursor: Any, batch: list[dict[str, Any]]) -> tuple[int, int]:
-    """
-    Upsert one batch of normalized records. Returns (inserted, updated) counts.
-
-    We can't use execute_batch here because we need RETURNING values to
-    distinguish inserts from updates. So we run them one at a time within
-    the same transaction — fast enough given how small each statement is.
-    """
+def _flush_batch(
+    cursor: Any,
+    batch: list[dict[str, Any]],
+    conn: Any = None,
+) -> tuple[int, int]:
+    
     inserted = 0
     updated = 0
     for record in batch:
@@ -345,6 +349,8 @@ def _flush_batch(cursor: Any, batch: list[dict[str, Any]]) -> tuple[int, int]:
             inserted += 1
         else:
             updated += 1
+    if conn is not None:
+        conn.commit()
     return inserted, updated
 
 
