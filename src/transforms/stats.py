@@ -46,6 +46,21 @@ ORDER BY created_at ASC
 LIMIT 1;
 """
 
+SQL_LATEST_OPEN = """
+SELECT
+    id,
+    source_id,
+    created_at,
+    street_address,
+    ward_id,
+    ST_Y(location::geometry) AS lat,
+    ST_X(location::geometry) AS lng
+FROM potholes
+WHERE status IN ('open', 'dup_open')
+ORDER BY created_at DESC
+LIMIT 1;
+"""
+
 SQL_SLA_BREACH_COUNT = """
 SELECT count(*) AS breaches
 FROM potholes
@@ -108,6 +123,25 @@ def refresh_dashboard_cache(cursor: Any) -> None:
     else:
         logger.warning("  No open potholes found — skipping oldest_open_pothole")
 
+    # --- latest_open_report ---
+    cursor.execute(SQL_LATEST_OPEN)
+    row = cursor.fetchone()
+    if row is not None:
+        cols = [d[0] for d in cursor.description]
+        latest = dict(zip(cols, row))
+        latest["id"] = str(latest["id"])
+        latest["created_at"] = latest["created_at"].isoformat()
+        cursor.execute(
+            UPSERT_DASHBOARD_CACHE,
+            {"key": "latest_open_report", "value": Json(latest)},
+        )
+        logger.info(
+            "  latest_open_report: %s, created %s, ward %s",
+            latest["source_id"], latest["created_at"], latest["ward_id"],
+        )
+    else:
+        logger.warning("  No open reports found — skipping latest_open_report")
+        
     # --- sla_breach_count ---
     cursor.execute(SQL_SLA_BREACH_COUNT)
     (breaches,) = cursor.fetchone()
