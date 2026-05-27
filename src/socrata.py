@@ -48,22 +48,27 @@ def _build_session() -> requests.Session:
 
 def _normalize_socrata_timestamp(value: str) -> str:
     """
-    Convert an ISO timestamp string to the format Socrata's SoQL expects:
-    'YYYY-MM-DDTHH:MM:SS' (no timezone, no fractional seconds).
+    Convert an ISO timestamp string to a format Socrata's SoQL accepts
+    for floating_timestamp columns.
 
-    The city's created_date and last_modified_date are timezone-naive
-    'floating timestamps' in SoQL. Passing strings with timezone suffixes
-    triggers a type-mismatch error. We strip both.
+    Socrata floating timestamps are timezone-naive. SoQL literals must
+    NOT carry a timezone suffix (no 'Z', no '+00:00'). The parser
+    interprets naive literals as UTC for comparison against the column.
 
-    Accepts:  '2026-05-21'                        -> '2026-05-21T00:00:00'
-              '2026-05-21T22:35:38'               -> '2026-05-21T22:35:38'
-              '2026-05-21T22:35:38.520401+00:00'  -> '2026-05-21T22:35:38'
+    Accepts:
+      '2026-05-21'                        -> '2026-05-21T00:00:00'
+      '2026-05-21T22:35:38'               -> '2026-05-21T22:35:38'
+      '2026-05-21T22:35:38.520401+00:00'  -> '2026-05-21T22:35:38' (UTC)
+      '2026-05-21T17:35:38-05:00'         -> '2026-05-21T22:35:38' (converted to UTC)
     """
     from dateutil import parser as dateparser
+    from datetime import timezone
 
     dt = dateparser.isoparse(value)
-    # Drop tz and microseconds — Socrata wants 'YYYY-MM-DDTHH:MM:SS'.
-    return dt.replace(tzinfo=None, microsecond=0).isoformat()
+    # If aware, convert to UTC; if naive, assume already UTC.
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.replace(microsecond=0).isoformat()
 
 
 def _build_where_clause(
