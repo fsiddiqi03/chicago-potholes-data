@@ -12,10 +12,16 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from dateutil import parser as dateparser
 
 logger = logging.getLogger(__name__)
+
+# Socrata's created_date / closed_date are Chicago-local wall-clock times
+# carrying no offset. We stamp them with this zone so they store as the
+# correct instant. ZoneInfo (not a fixed offset) so CST/CDT is handled.
+_CHICAGO_TZ = ZoneInfo("America/Chicago")
 
 
 # Maps the city's (status, duplicate) tuple to our pothole_status enum value.
@@ -34,16 +40,20 @@ def _parse_timestamp(value: Optional[str]) -> Optional[str]:
     insertion as timestamptz. Returns None for missing/empty values.
 
     Socrata returns timestamps like '2026-05-21T16:17:57.000' — naive ISO
-    without timezone. We treat these as America/Chicago local time, which
-    is what they actually are (the city's own clock). Returning a naive
-    string lets Postgres interpret it according to the session timezone
-    we set in db.py.
+    without timezone. They are actually America/Chicago local time (the
+    city's own clock). We attach that zone so the value carries an explicit
+    offset (e.g. -05:00), which makes ::timestamptz store the correct
+    instant regardless of the DB session's timezone. Relying on the session
+    timezone is not viable: poolers (e.g. PgBouncer) silently drop the
+    startup `timezone` option, leaving the session at UTC.
     """
     if not value:
         return None
     try:
         # dateparser.isoparse is permissive of Socrata's variations.
         dt = dateparser.isoparse(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_CHICAGO_TZ)
         return dt.isoformat()
     except (ValueError, TypeError):
         return None
