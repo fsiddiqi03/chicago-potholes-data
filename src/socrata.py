@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import time
 from typing import Any, Iterator, Optional
+from zoneinfo import ZoneInfo
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -21,6 +22,10 @@ from urllib3.util.retry import Retry
 from .config import HTTP_TIMEOUT_SECONDS, SOCRATA_BASE_URL, WARDS_DATASET_ID, POTHOLE_SR_SHORT_CODE, POTHOLES_DATASET_ID, PAGE_SIZE, INTER_REQUEST_DELAY_SECONDS
 
 logger = logging.getLogger(__name__)
+
+# Chicago 311 floating_timestamp columns are Chicago wall-clock time.
+# zoneinfo handles CDT/CST DST transitions automatically.
+_CHICAGO_TZ = ZoneInfo("America/Chicago")
 
 
 
@@ -51,23 +56,29 @@ def _normalize_socrata_timestamp(value: str) -> str:
     Convert an ISO timestamp string to a format Socrata's SoQL accepts
     for floating_timestamp columns.
 
-    Socrata floating timestamps are timezone-naive. SoQL literals must
-    NOT carry a timezone suffix (no 'Z', no '+00:00'). The parser
-    interprets naive literals as UTC for comparison against the column.
+    Socrata floating timestamps are timezone-naive. The Chicago 311
+    dataset's created_date / last_modified_date columns hold Chicago
+    local wall-clock time (CDT/CST), NOT UTC, despite carrying no
+    offset. Comparing a UTC literal against these columns shifts the
+    window by 5–6 hours and silently drops fresh records. So we
+    convert aware inputs to America/Chicago before stripping the tz.
 
-    Accepts:
+    SoQL literals must also not carry a timezone suffix (no 'Z',
+    no '+00:00').
+
+    Accepts (assuming CDT, UTC-5):
       '2026-05-21'                        -> '2026-05-21T00:00:00'
       '2026-05-21T22:35:38'               -> '2026-05-21T22:35:38'
-      '2026-05-21T22:35:38.520401+00:00'  -> '2026-05-21T22:35:38' (UTC)
-      '2026-05-21T17:35:38-05:00'         -> '2026-05-21T22:35:38' (converted to UTC)
+                                             (naive assumed Chicago-local)
+      '2026-05-21T22:35:38.520401+00:00'  -> '2026-05-21T17:35:38'
+                                             (UTC -> Chicago)
+      '2026-05-21T17:35:38-05:00'         -> '2026-05-21T17:35:38'
     """
     from dateutil import parser as dateparser
-    from datetime import timezone
 
     dt = dateparser.isoparse(value)
-    # If aware, convert to UTC; if naive, assume already UTC.
     if dt.tzinfo is not None:
-        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        dt = dt.astimezone(_CHICAGO_TZ).replace(tzinfo=None)
     return dt.replace(microsecond=0).isoformat()
 
 
