@@ -193,6 +193,12 @@ closed_on_date AS (
 recent_repairs AS (
     SELECT
         ward_id,
+        -- Sample size behind median_days_to_fix. Exposed so consumers can
+        -- suppress a ranking they shouldn't trust rather than us silently
+        -- dropping the ward. Low-volume wards close 1-2 potholes a month;
+        -- percentile_cont over n=1 returns that single ticket's duration,
+        -- which would otherwise rank the ward fastest in the city.
+        count(*) AS repair_sample_n,
         percentile_cont(0.5) WITHIN GROUP (
             ORDER BY extract(epoch FROM completed_at - created_at) / 86400
         ) AS median_days_to_fix
@@ -208,6 +214,7 @@ SELECT
     coalesce(c.closed_count, 0)            AS closed_count,
     round(o.avg_days_open::numeric, 2)     AS avg_days_open,
     round(r.median_days_to_fix::numeric, 2) AS median_days_to_fix,
+    coalesce(r.repair_sample_n, 0)         AS repair_sample_n,
     round(o.pct_over_sla::numeric, 2)      AS pct_over_sla
 FROM wards w
 LEFT JOIN open_stats     o ON o.ward_id = w.id
@@ -219,17 +226,18 @@ ORDER BY w.id;
 UPSERT_WARD_DAILY_STATS = """
 INSERT INTO ward_daily_stats (
     ward_id, date, open_count, closed_count,
-    avg_days_open, median_days_to_fix, pct_over_sla
+    avg_days_open, median_days_to_fix, repair_sample_n, pct_over_sla
 )
 VALUES (
     %(ward_id)s, %(date)s, %(open_count)s, %(closed_count)s,
-    %(avg_days_open)s, %(median_days_to_fix)s, %(pct_over_sla)s
+    %(avg_days_open)s, %(median_days_to_fix)s, %(repair_sample_n)s, %(pct_over_sla)s
 )
 ON CONFLICT (ward_id, date) DO UPDATE SET
     open_count          = EXCLUDED.open_count,
     closed_count        = EXCLUDED.closed_count,
     avg_days_open       = EXCLUDED.avg_days_open,
     median_days_to_fix  = EXCLUDED.median_days_to_fix,
+    repair_sample_n     = EXCLUDED.repair_sample_n,
     pct_over_sla        = EXCLUDED.pct_over_sla;
 """
 
@@ -244,6 +252,12 @@ def refresh_ward_daily_stats(
     Always writes exactly 50 rows (one per ward), even for wards with no
     activity — those get zeros and nulls. Easier for the frontend to consume
     50 known rows than to handle missing wards.
+
+    Note that median_days_to_fix is emitted for ANY ward with at least one
+    qualifying repair, however few. It is paired with repair_sample_n so
+    consumers can decide what's rankable; we deliberately don't apply a
+    minimum here, because filtering server-side would null the median and
+    make the whole ward vanish from a public accountability dashboard.
     """
     if target_date is None:
         # Use the DB's notion of 'today' for consistency across runs.
