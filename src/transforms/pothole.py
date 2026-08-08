@@ -90,28 +90,38 @@ def _classify_status(raw_status: Optional[str], duplicate: bool) -> Optional[str
 
 def _infer_closed_outcome(
     status: str,
-    created_at: Optional[str],
     completed_at: Optional[str],
     duplicate: bool,
 ) -> str:
     """
-    Heuristic classification of WHY a ticket was closed.
+    Classify WHY a ticket was closed.
 
     The city marks everything 'Completed' but the reality is several things:
-    a real repair, an inspection that found nothing, or a duplicate.
-    We infer a more honest outcome from available signals.
+    a real repair, an inspection that found nothing, or a duplicate. The
+    current 311 dataset (v6vf-nfxy) publishes no outcome field, so anything
+    beyond duplicate/canceled has to be inferred.
 
     Rules (in order):
-      - canceled status            -> 'other' (canceled isn't really a closure)
-      - duplicate flag is true     -> 'duplicate'
-      - status not completed       -> 'unknown' (still open)
-      - closed within 24 hours     -> 'no_pothole_found' (too fast for a real repair)
-      - closed > 24h after created -> 'repaired'
-      - anything else              -> 'unknown'
+      - canceled status        -> 'other' (canceled isn't really a closure)
+      - duplicate flag is true -> 'duplicate'
+      - status not completed   -> 'unknown' (still open)
+      - no closed_date         -> 'unknown' (completed but undated; don't guess)
+      - otherwise              -> 'repaired'
 
-    These are starting heuristics. We can refine them after we see real
-    distributions in the loaded data. The methodology page explains this
-    publicly so we're transparent about the inference.
+    We deliberately do NOT emit 'no_pothole_found'. An earlier version treated
+    a sub-24h close as "too fast to be a real repair" — that is backwards. The
+    legacy dataset (7as2-ds3y) carries ground-truth outcome labels alongside
+    timestamps, and over 50k closed PHF records it says the opposite:
+
+        closed < 24h:  95.3% 'Pothole Patched',  1.3% 'No Potholes Found'
+        closed 1d+:    77.1% 'Pothole Patched',  8.6% 'No Potholes Found'
+
+    ('number_of_potholes_filled_on_block' agrees: 95.2% vs 76.4% nonzero.)
+
+    Fast closes are crews already on the block patching and closing on the
+    spot, i.e. the *most* reliably-real repairs. With no published outcome
+    field there is no signal left that distinguishes a no-find, so we don't
+    pretend there is one.
     """
     if status == "canceled":
         return "other"
@@ -119,18 +129,8 @@ def _infer_closed_outcome(
         return "duplicate"
     if status not in ("completed", "dup_closed"):
         return "unknown"
-    if not created_at or not completed_at:
+    if not completed_at:
         return "unknown"
-
-    try:
-        created = dateparser.isoparse(created_at)
-        completed = dateparser.isoparse(completed_at)
-        hours_open = (completed - created).total_seconds() / 3600.0
-    except (ValueError, TypeError):
-        return "unknown"
-
-    if hours_open < 24:
-        return "no_pothole_found"
     return "repaired"
 
 
@@ -182,7 +182,6 @@ def normalize_record(raw: dict[str, Any]) -> Optional[dict[str, Any]]:
     completed_at = _parse_timestamp(raw.get("closed_date"))
     closed_outcome = _infer_closed_outcome(
         status=status,
-        created_at=created_at,
         completed_at=completed_at,
         duplicate=duplicate,
     )
