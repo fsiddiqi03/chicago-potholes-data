@@ -194,9 +194,12 @@ WITH open_stats AS (
 ),
 closed_on_date AS (
     -- closed_count is every ticket that left the queue on this date;
-    -- repaired_count is the subset that was actual asphalt. Roughly 38% of
+    -- repaired_count is the subset that was actual asphalt. Over a third of
     -- closures are duplicate cleanup, so reporting closed_count as "work
-    -- done" overstates a ward's output by more than a third.
+    -- done" overstates a ward's output substantially.
+    -- (Keep literal percent signs out of this string. psycopg2 scans the
+    -- whole query for placeholders, SQL comments included, and a stray one
+    -- breaks named-parameter binding with "dict is not a sequence".)
     SELECT
         ward_id,
         count(*) AS closed_count,
