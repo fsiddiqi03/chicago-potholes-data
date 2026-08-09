@@ -17,7 +17,7 @@ import logging
 from datetime import date as DateType, timedelta
 from typing import Any, Optional
 
-from psycopg2.extras import Json
+from psycopg2.extras import Json, execute_batch
 
 from ..db import get_connection
 
@@ -196,16 +196,41 @@ def refresh_dashboard_cache(cursor: Any) -> None:
 RESOLUTION_COHORT_DAYS = 90
 
 SQL_WARD_DAILY_STATS = """
-WITH open_stats AS (
+WITH asof AS (
+    -- Every window in this query is measured from this instant rather than
+    -- now(), which is what makes a past date reconstructable. For today it
+    -- resolves to now(), so the live refresh behaves exactly as it always
+    -- did; for a past date it is the end of that day. Backfill and the
+    -- 4-hourly refresh therefore share one definition, and a trend chart
+    -- has no seam where reconstructed rows meet live ones.
     SELECT
-        ward_id,
+        %(target_date)s::date AS d,
+        least(
+            (%(target_date)s::date + interval '1 day')::timestamptz,
+            now()
+        ) AS t
+),
+open_at AS (
+    -- Open-ness is derived from timestamps, not from the current status
+    -- column: status tells us where a ticket stands today, which is useless
+    -- for reconstructing a past day. Duplicates and cancellations are
+    -- excluded so one pothole is never counted twice.
+    SELECT p.ward_id, p.created_at
+    FROM potholes p, asof a
+    WHERE p.ward_id IS NOT NULL
+      AND p.status IN ('open', 'completed')
+      AND p.created_at < a.t
+      AND (p.completed_at IS NULL OR p.completed_at >= a.t)
+),
+open_stats AS (
+    SELECT
+        o.ward_id,
         count(*) AS open_count,
-        avg(extract(epoch FROM (now() - created_at)) / 86400) AS avg_days_open,
-        100.0 * count(*) FILTER (WHERE created_at < now() - interval '7 days')
+        avg(extract(epoch FROM (a.t - o.created_at)) / 86400) AS avg_days_open,
+        100.0 * count(*) FILTER (WHERE o.created_at < a.t - interval '7 days')
              / count(*) AS pct_over_sla
-    FROM potholes
-    WHERE status = 'open' AND ward_id IS NOT NULL
-    GROUP BY ward_id
+    FROM open_at o, asof a
+    GROUP BY o.ward_id
 ),
 closed_on_date AS (
     -- closed_count is every ticket that left the queue on this date;
@@ -213,12 +238,17 @@ closed_on_date AS (
     -- closures are duplicate cleanup, so reporting closed_count as "work
     -- done" overstates a ward's output substantially.
     SELECT
-        ward_id,
+        p.ward_id,
         count(*) AS closed_count,
-        count(*) FILTER (WHERE closed_outcome = 'repaired') AS repaired_count
-    FROM potholes
-    WHERE completed_at::date = %(target_date)s AND ward_id IS NOT NULL
-    GROUP BY ward_id
+        count(*) FILTER (WHERE p.closed_outcome = 'repaired') AS repaired_count
+    -- Half-open range rather than completed_at::date = a.d: same rows, but
+    -- a cast on the column can't use an index and this runs once per day
+    -- of a backfill.
+    FROM potholes p, asof a
+    WHERE p.completed_at >= a.d::timestamptz
+      AND p.completed_at <  (a.d + 1)::timestamptz
+      AND p.ward_id IS NOT NULL
+    GROUP BY p.ward_id
 ),
 resolution AS (
     -- Time-to-resolution across the WHOLE creation cohort, not just the
@@ -228,25 +258,31 @@ resolution AS (
     -- ranking for lack of data. This is the ranking metric; the
     -- recent_repairs median below is context only.
     SELECT
-        ward_id,
-        count(*)                                  AS cohort_n,
-        count(*) FILTER (WHERE completed_at IS NULL) AS still_open_n,
+        p.ward_id,
+        count(*) AS cohort_n,
+        count(*) FILTER (
+            WHERE p.completed_at IS NULL OR p.completed_at >= a.t
+        ) AS still_open_n,
         percentile_cont(0.5) WITHIN GROUP (
+            -- least(..., a.t) matters for past dates: a pothole closed
+            -- AFTER the as-of instant was still open then, so it must be
+            -- censored at t rather than credited with its eventual duration.
             ORDER BY extract(
-                epoch FROM (coalesce(completed_at, now()) - created_at)
+                epoch FROM (least(coalesce(p.completed_at, a.t), a.t) - p.created_at)
             ) / 86400
         ) AS median_days_to_resolve
-    FROM potholes
-    WHERE ward_id IS NOT NULL
+    FROM potholes p, asof a
+    WHERE p.ward_id IS NOT NULL
       -- Duplicates and cancellations aren't work; excluding both means
       -- this can't be gamed by reclassifying a backlog.
-      AND status IN ('open', 'completed')
-      AND created_at >= now() - make_interval(days => %(cohort_days)s)
-    GROUP BY ward_id
+      AND p.status IN ('open', 'completed')
+      AND p.created_at >= a.t - make_interval(days => %(cohort_days)s)
+      AND p.created_at < a.t
+    GROUP BY p.ward_id
 ),
 recent_repairs AS (
     SELECT
-        ward_id,
+        p.ward_id,
         -- Doubles as a throughput metric ("repairs completed, 30d") and as
         -- the sample size behind median_days_to_fix. The latter matters:
         -- low-volume wards close 1-2 potholes a month, and percentile_cont
@@ -256,13 +292,14 @@ recent_repairs AS (
         -- median_days_to_resolve above is the ranking metric.
         count(*) AS repair_sample_n,
         percentile_cont(0.5) WITHIN GROUP (
-            ORDER BY extract(epoch FROM completed_at - created_at) / 86400
+            ORDER BY extract(epoch FROM p.completed_at - p.created_at) / 86400
         ) AS median_days_to_fix
-    FROM potholes
-    WHERE closed_outcome = 'repaired'
-      AND completed_at >= now() - interval '30 days'
-      AND ward_id IS NOT NULL
-    GROUP BY ward_id
+    FROM potholes p, asof a
+    WHERE p.closed_outcome = 'repaired'
+      AND p.completed_at >= a.t - interval '30 days'
+      AND p.completed_at < a.t
+      AND p.ward_id IS NOT NULL
+    GROUP BY p.ward_id
 )
 SELECT
     w.id AS ward_id,
@@ -330,7 +367,8 @@ LEFT JOIN LATERAL (
         count(*) FILTER (WHERE closed_outcome = 'repaired') AS repaired_count
     FROM potholes p
     WHERE p.ward_id = w.id
-      AND p.completed_at::date = %(target_date)s
+      AND p.completed_at >= %(target_date)s::date::timestamptz
+      AND p.completed_at <  (%(target_date)s::date + 1)::timestamptz
 ) c ON true
 WHERE wds.ward_id = w.id
   AND wds.date = %(target_date)s
@@ -356,6 +394,7 @@ def finalize_prior_day(cursor: Any, target_date: DateType) -> None:
 def refresh_ward_daily_stats(
     cursor: Any,
     target_date: Optional[DateType] = None,
+    finalize_prior: bool = True,
 ) -> None:
     """
     Compute and upsert ward_daily_stats for the given date (defaults to today).
@@ -388,16 +427,24 @@ def refresh_ward_daily_stats(
         logger.warning("  No rows returned — wards table empty?")
         return
 
+    # One round trip instead of 50. Matters little for the 4-hourly refresh
+    # but dominates a backfill, where per-statement latency to a hosted
+    # Postgres was costing more than the query itself.
+    records = []
     for row in rows:
         record = dict(zip(cols, row))
         record["date"] = target_date
-        cursor.execute(UPSERT_WARD_DAILY_STATS, record)
+        records.append(record)
+    execute_batch(cursor, UPSERT_WARD_DAILY_STATS, records, page_size=50)
 
     logger.info("  Wrote %d ward stats rows for %s", len(rows), target_date)
 
     # The previous day stopped being written to the moment the date rolled
     # over, mid-afternoon Chicago time. Go back and settle its counts.
-    finalize_prior_day(cursor, target_date)
+    # A backfill walking dates forward passes finalize_prior=False, since
+    # the next iteration rewrites that day in full anyway.
+    if finalize_prior:
+        finalize_prior_day(cursor, target_date)
 
 
 # =============================================================
