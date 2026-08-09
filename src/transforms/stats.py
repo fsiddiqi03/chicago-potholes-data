@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from datetime import date as DateType
+from datetime import date as DateType, timedelta
 from typing import Any, Optional
 
 from psycopg2.extras import Json
@@ -172,6 +172,14 @@ def refresh_dashboard_cache(cursor: Any) -> None:
 # =============================================================
 # ward_daily_stats refresh
 # =============================================================
+# Creation-cohort window for median_days_to_resolve. Every ward is measured
+# over the same window, so the number is comparable across wards but capped
+# by it: a pothole open the whole time contributes at most this many days.
+# Shorter reacts faster to current performance; longer truncates less. At 90
+# the worst-ten list is stable against a 90-180d window (7/10 overlap), while
+# mid-table wards move ~8 places — rank the extremes, don't over-read the middle.
+RESOLUTION_COHORT_DAYS = 90
+
 SQL_WARD_DAILY_STATS = """
 WITH open_stats AS (
     SELECT
@@ -185,9 +193,40 @@ WITH open_stats AS (
     GROUP BY ward_id
 ),
 closed_on_date AS (
-    SELECT ward_id, count(*) AS closed_count
+    -- closed_count is every ticket that left the queue on this date;
+    -- repaired_count is the subset that was actual asphalt. Roughly 38% of
+    -- closures are duplicate cleanup, so reporting closed_count as "work
+    -- done" overstates a ward's output by more than a third.
+    SELECT
+        ward_id,
+        count(*) AS closed_count,
+        count(*) FILTER (WHERE closed_outcome = 'repaired') AS repaired_count
     FROM potholes
     WHERE completed_at::date = %(target_date)s AND ward_id IS NOT NULL
+    GROUP BY ward_id
+),
+resolution AS (
+    -- Time-to-resolution across the WHOLE creation cohort, not just the
+    -- tickets that happened to close. Still-open potholes are counted at
+    -- their current age (right-censored), so a ward that closes nothing
+    -- sees this number climb every day instead of vanishing from the
+    -- ranking for lack of data. This is the ranking metric; the
+    -- recent_repairs median below is context only.
+    SELECT
+        ward_id,
+        count(*)                                  AS cohort_n,
+        count(*) FILTER (WHERE completed_at IS NULL) AS still_open_n,
+        percentile_cont(0.5) WITHIN GROUP (
+            ORDER BY extract(
+                epoch FROM (coalesce(completed_at, now()) - created_at)
+            ) / 86400
+        ) AS median_days_to_resolve
+    FROM potholes
+    WHERE ward_id IS NOT NULL
+      -- Duplicates and cancellations aren't work; excluding both means
+      -- this can't be gamed by reclassifying a backlog.
+      AND status IN ('open', 'completed')
+      AND created_at >= now() - make_interval(days => %(cohort_days)s)
     GROUP BY ward_id
 ),
 recent_repairs AS (
@@ -212,34 +251,89 @@ SELECT
     w.id AS ward_id,
     coalesce(o.open_count, 0)              AS open_count,
     coalesce(c.closed_count, 0)            AS closed_count,
+    coalesce(c.repaired_count, 0)          AS repaired_count,
     round(o.avg_days_open::numeric, 2)     AS avg_days_open,
     round(r.median_days_to_fix::numeric, 2) AS median_days_to_fix,
     coalesce(r.repair_sample_n, 0)         AS repair_sample_n,
+    round(res.median_days_to_resolve::numeric, 1) AS median_days_to_resolve,
+    coalesce(res.cohort_n, 0)              AS cohort_n,
+    coalesce(res.still_open_n, 0)          AS still_open_n,
     round(o.pct_over_sla::numeric, 2)      AS pct_over_sla
 FROM wards w
-LEFT JOIN open_stats     o ON o.ward_id = w.id
-LEFT JOIN closed_on_date c ON c.ward_id = w.id
-LEFT JOIN recent_repairs r ON r.ward_id = w.id
+LEFT JOIN open_stats     o   ON o.ward_id   = w.id
+LEFT JOIN closed_on_date c   ON c.ward_id   = w.id
+LEFT JOIN recent_repairs r   ON r.ward_id   = w.id
+LEFT JOIN resolution     res ON res.ward_id = w.id
 ORDER BY w.id;
 """
 
 UPSERT_WARD_DAILY_STATS = """
 INSERT INTO ward_daily_stats (
-    ward_id, date, open_count, closed_count,
-    avg_days_open, median_days_to_fix, repair_sample_n, pct_over_sla
+    ward_id, date, open_count, closed_count, repaired_count,
+    avg_days_open, median_days_to_fix, repair_sample_n,
+    median_days_to_resolve, cohort_n, still_open_n, pct_over_sla
 )
 VALUES (
-    %(ward_id)s, %(date)s, %(open_count)s, %(closed_count)s,
-    %(avg_days_open)s, %(median_days_to_fix)s, %(repair_sample_n)s, %(pct_over_sla)s
+    %(ward_id)s, %(date)s, %(open_count)s, %(closed_count)s, %(repaired_count)s,
+    %(avg_days_open)s, %(median_days_to_fix)s, %(repair_sample_n)s,
+    %(median_days_to_resolve)s, %(cohort_n)s, %(still_open_n)s, %(pct_over_sla)s
 )
 ON CONFLICT (ward_id, date) DO UPDATE SET
-    open_count          = EXCLUDED.open_count,
-    closed_count        = EXCLUDED.closed_count,
-    avg_days_open       = EXCLUDED.avg_days_open,
-    median_days_to_fix  = EXCLUDED.median_days_to_fix,
-    repair_sample_n     = EXCLUDED.repair_sample_n,
-    pct_over_sla        = EXCLUDED.pct_over_sla;
+    open_count             = EXCLUDED.open_count,
+    closed_count           = EXCLUDED.closed_count,
+    repaired_count         = EXCLUDED.repaired_count,
+    avg_days_open          = EXCLUDED.avg_days_open,
+    median_days_to_fix     = EXCLUDED.median_days_to_fix,
+    repair_sample_n        = EXCLUDED.repair_sample_n,
+    median_days_to_resolve = EXCLUDED.median_days_to_resolve,
+    cohort_n               = EXCLUDED.cohort_n,
+    still_open_n           = EXCLUDED.still_open_n,
+    pct_over_sla           = EXCLUDED.pct_over_sla;
 """
+
+
+# closed_count / repaired_count are the only genuinely date-scoped columns in
+# ward_daily_stats — everything else is a now()-relative snapshot. The last
+# run of a given day fires hours before the day ends (~6% of Chicago closures
+# land after it), and the next run has already advanced to a new date, so a
+# day's counts are permanently short unless we come back for them.
+#
+# This re-counts ONLY those two columns for an already-past date. It
+# deliberately does not touch the snapshot columns: those were correct as of
+# when they were written, and recomputing them now would stamp today's
+# numbers onto yesterday's row.
+SQL_FINALIZE_DAY_COUNTS = """
+UPDATE ward_daily_stats wds
+SET closed_count   = c.closed_count,
+    repaired_count = c.repaired_count
+FROM wards w
+LEFT JOIN LATERAL (
+    SELECT
+        count(*) AS closed_count,
+        count(*) FILTER (WHERE closed_outcome = 'repaired') AS repaired_count
+    FROM potholes p
+    WHERE p.ward_id = w.id
+      AND p.completed_at::date = %(target_date)s
+) c ON true
+WHERE wds.ward_id = w.id
+  AND wds.date = %(target_date)s
+  AND (wds.closed_count   IS DISTINCT FROM c.closed_count
+    OR wds.repaired_count IS DISTINCT FROM c.repaired_count);
+"""
+
+
+def finalize_prior_day(cursor: Any, target_date: DateType) -> None:
+    """
+    Re-count the day before target_date so its closure totals are final.
+
+    No-ops if that date has no rows (a gap in runs) — the snapshot columns
+    can't be reconstructed after the fact, so we'd rather leave the day
+    missing than write a row that's half real and half fabricated.
+    """
+    prior = target_date - timedelta(days=1)
+    cursor.execute(SQL_FINALIZE_DAY_COUNTS, {"target_date": prior})
+    logger.info("  Finalized closure counts for %s (%d rows changed)",
+                prior, cursor.rowcount)
 
 
 def refresh_ward_daily_stats(
@@ -266,7 +360,10 @@ def refresh_ward_daily_stats(
 
     logger.info("Refreshing ward_daily_stats for %s...", target_date)
 
-    cursor.execute(SQL_WARD_DAILY_STATS, {"target_date": target_date})
+    cursor.execute(
+        SQL_WARD_DAILY_STATS,
+        {"target_date": target_date, "cohort_days": RESOLUTION_COHORT_DAYS},
+    )
     rows = cursor.fetchall()
     cols = [d[0] for d in cursor.description]
 
@@ -280,6 +377,10 @@ def refresh_ward_daily_stats(
         cursor.execute(UPSERT_WARD_DAILY_STATS, record)
 
     logger.info("  Wrote %d ward stats rows for %s", len(rows), target_date)
+
+    # The previous day stopped being written to the moment the date rolled
+    # over, mid-afternoon Chicago time. Go back and settle its counts.
+    finalize_prior_day(cursor, target_date)
 
 
 # =============================================================
