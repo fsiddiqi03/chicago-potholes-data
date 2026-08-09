@@ -28,6 +28,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# NOTE for every SQL string in this module: keep literal percent signs out of
+# them, comments included. psycopg2 scans the whole query for placeholders and
+# does not skip SQL comments, so a stray one drops it into positional binding
+# and any dict of params fails with "dict is not a sequence". Write "a third"
+# rather than "33 pct", or escape it as a doubled percent sign.
+
+
 # =============================================================
 # dashboard_cache refresh
 # =============================================================
@@ -46,6 +53,11 @@ ORDER BY created_at ASC
 LIMIT 1;
 """
 
+# Intentionally includes dup_open, unlike every other query here. This is the
+# latest *report*, and a duplicate ticket is a real person reporting a real
+# pothole. Counting queries exclude duplicates because two tickets on one
+# pothole would double-count the backlog; a "most recent report" doesn't.
+# Don't "fix" this to match the others.
 SQL_LATEST_OPEN = """
 SELECT
     id,
@@ -75,17 +87,20 @@ SELECT
         WHERE status IN ('completed', 'dup_closed')
           AND completed_at >= now() - interval '30 days'
     ) AS completed_30d,
+    -- completed_30d counts everything that left the queue, duplicate
+    -- cleanup included. repaired_30d is the subset that was actual
+    -- asphalt — use it anywhere the UI says "fixed".
+    count(*) FILTER (
+        WHERE closed_outcome = 'repaired'
+          AND completed_at >= now() - interval '30 days'
+    ) AS repaired_30d,
     round(
         avg(extract(epoch FROM completed_at - created_at) / 86400) FILTER (
             WHERE closed_outcome = 'repaired'
               AND completed_at >= now() - interval '30 days'
         )::numeric,
         1
-    ) AS avg_days_to_fix_30d,
-    count(*) FILTER (
-        WHERE closed_outcome = 'no_pothole_found'
-          AND completed_at >= now() - interval '30 days'
-    ) AS closed_no_pothole_30d
+    ) AS avg_days_to_fix_30d
 FROM potholes;
 """
 
@@ -197,9 +212,6 @@ closed_on_date AS (
     -- repaired_count is the subset that was actual asphalt. Over a third of
     -- closures are duplicate cleanup, so reporting closed_count as "work
     -- done" overstates a ward's output substantially.
-    -- (Keep literal percent signs out of this string. psycopg2 scans the
-    -- whole query for placeholders, SQL comments included, and a stray one
-    -- breaks named-parameter binding with "dict is not a sequence".)
     SELECT
         ward_id,
         count(*) AS closed_count,
@@ -235,11 +247,13 @@ resolution AS (
 recent_repairs AS (
     SELECT
         ward_id,
-        -- Sample size behind median_days_to_fix. Exposed so consumers can
-        -- suppress a ranking they shouldn't trust rather than us silently
-        -- dropping the ward. Low-volume wards close 1-2 potholes a month;
-        -- percentile_cont over n=1 returns that single ticket's duration,
-        -- which would otherwise rank the ward fastest in the city.
+        -- Doubles as a throughput metric ("repairs completed, 30d") and as
+        -- the sample size behind median_days_to_fix. The latter matters:
+        -- low-volume wards close 1-2 potholes a month, and percentile_cont
+        -- over n=1 is just that one ticket's duration. Never rank on
+        -- median_days_to_fix — it only sees potholes that got fixed, so a
+        -- ward that repairs nothing has no data rather than a bad score.
+        -- median_days_to_resolve above is the ranking metric.
         count(*) AS repair_sample_n,
         percentile_cont(0.5) WITHIN GROUP (
             ORDER BY extract(epoch FROM completed_at - created_at) / 86400
@@ -350,11 +364,11 @@ def refresh_ward_daily_stats(
     activity — those get zeros and nulls. Easier for the frontend to consume
     50 known rows than to handle missing wards.
 
-    Note that median_days_to_fix is emitted for ANY ward with at least one
-    qualifying repair, however few. It is paired with repair_sample_n so
-    consumers can decide what's rankable; we deliberately don't apply a
-    minimum here, because filtering server-side would null the median and
-    make the whole ward vanish from a public accountability dashboard.
+    Nothing here is ever filtered out for thin data. A ward that repairs
+    almost nothing is the most important row on an accountability dashboard,
+    and any server-side minimum would null its median and drop it from the
+    leaderboard entirely. Rank on median_days_to_resolve, which counts every
+    pothole in the cohort including the ones still sitting open.
     """
     if target_date is None:
         # Use the DB's notion of 'today' for consistency across runs.
